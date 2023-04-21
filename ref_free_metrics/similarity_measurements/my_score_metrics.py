@@ -23,6 +23,9 @@ import config
 import json
 
 
+from torch import cuda
+
+
 def get_idf(doc_token_list):
     df_dic = {}
     for i,doc_tokens in enumerate(doc_token_list):
@@ -450,6 +453,227 @@ def run_my_score_metrics(year, ref_metric, wmd_score_type, wmd_weight_type,
     for kk in results:
         print('{}:\t{}'.format(kk,results[kk]))
 
+######################################################
+#
+#   EVAL_BASE SCORE FUNCTION
+#  
+#   DON'T KNOW IF THIS WILL WORK
+#
+#
+#   Input: [str, str, str]                      <--- 2 of them, 1 pred, 1 ref 
+#   Output: {'score': [float, float, float]}    <--- EvalBase type 
+#
+#####################################################
+def score_function_eval_base(predictions, references):
+
+
+    # Some variables 
+    # These variables directly come from bash input, so i dont know what they mean
+
+    sent_represnt_type = 'mean_all'     # this is fixed dont change
+    
+    map_type_ref = 'st'                 # IDK what this variable is in the first place,
+                                        # choices are t, s, st maybe stands for token, sentence, sentence + token
+    map_type_summ = 'st'                # same as above
+    
+    wmd_score_type = 'f1'               # defaults to f1
+                                        # choices are 'f1_beta', 'idf', and 'f1'
+    
+    device = 'cuda' if cuda.is_available() else 'cpu'
+    
+    # Load the Model
+    sent_transformer_path = SENT_TRANSFORMER_TYPE_PATH_DIC['bert_large_nli_stsb_mean_tokens']
+    bert_model = SentenceTransformer(sent_transformer_path, device=device)      #This SentenceTransformer isnt the default library, this guy modified it
+    
+    
+    # I think this part is getting reference vectors and all that
+    #####################################################################################################################################
+    
+    sent_info_dic, sent_vecs, sents_weights, token_vecs, all_tokens = parse_documents(references,bert_model,'','mean_all')
+    ref_dic = {k:sent_info_dic[k] for k in sent_info_dic if sents_weights[k] > 0.0}
+    ref_sources = set(ref_dic[k]['doc'] for k in ref_dic)
+    ref_sources = sorted(list(ref_sources))
+    
+    # get sents in ref/doc
+    ref_sents = []
+    ref_sents_vecs = []
+    ref_sents_weights = []
+    ref_tokens_vecs = []
+    ref_tokens = []
+    sorted_ref_dic_keys = sorted(ref_dic.keys())
+
+    for rs in ref_sources:
+        ref_sents.append([ref_dic[k]['text'] for k in sorted_ref_dic_keys if ref_dic[k]['doc'] == rs])
+        ref_sents_vecs.append([sent_vecs[k] for k in sorted_ref_dic_keys if ref_dic[k]['doc'] == rs])
+        ref_sents_weights.append([sents_weights[k] for k in sorted_ref_dic_keys if ref_dic[k]['doc'] == rs])
+        ref_tokens_vecs.append([token_vecs[k] for k in sorted_ref_dic_keys if ref_dic[k]['doc'] == rs])
+        ref_tokens.append([all_tokens[k] for k in sorted_ref_dic_keys if ref_dic[k]['doc'] == rs])
+    
+    # get the filtered vecs fro ref
+    filtered_ref_tokens_vecs = []
+    filtered_ref_tokens = []
+    filtered_ref_token_weights = []
+
+    # I have no idea what wTop means
+    # Assuming no wTop
+    ref_st_mrg_type = ''
+    if ref_st_mrg_type.startswith('wTop'):
+        wTopNum = int(ref_st_mrg_type.split('_')[0].strip()[4:])
+        token_level_idx_list = []
+        sent_level_idx_list = []
+        for doc_weights in ref_sents_weights:
+            doc_weights = np.array(doc_weights)
+            if doc_weights.all():
+                idxs_list = [k for k in range(len(doc_weights))]
+            else:
+                idxs_list = doc_weights.argsort().tolist()
+                idxs_list = idxs_list[::-1]
+            token_level_idx_list.append(idxs_list[:wTopNum])
+            if ref_st_mrg_type.endswith('sBottom'):
+                sent_level_idx_list.append(idxs_list[wTopNum:])
+            else:
+                assert ref_st_mrg_type.endswith('sAll')
+                sent_level_idx_list.append(idxs_list)
+    else:
+        token_level_idx_list = [[k for k in range(len(doc_weights))] for doc_weights in ref_sents_weights]
+        sent_level_idx_list = token_level_idx_list
+
+    for doc_idx in range(len(ref_sents)):
+        tvecs_in = [ref_tokens_vecs[doc_idx][k] for k in token_level_idx_list[doc_idx]]
+        tokens_in = [ref_tokens[doc_idx][k] for k in token_level_idx_list[doc_idx]]
+        # we use sent weight as the weight of each token
+        weights_in = [np.array([ref_sents_weights[doc_idx][k]]*len(ref_tokens[doc_idx][k])) for k in token_level_idx_list[doc_idx]]
+        vv, tt, ww = get_token_vecs(vecs=tvecs_in, tokens=tokens_in, weights=weights_in)
+        filtered_ref_tokens_vecs.append(vv)
+        filtered_ref_tokens.append(tt)
+        filtered_ref_token_weights.append(ww)
+    
+    filtered_ref_sents_vecs = []
+    filtered_ref_sent_weights = []
+    for svec_list, sweights, sent_level_idxs in zip(ref_sents_vecs, ref_sents_weights, sent_level_idx_list):
+        remain_svecs = None
+        remain_sweights = None
+        if len(sent_level_idxs) > 0:
+            # remain_svecs = [svec for svec in svec_list[wTopNum:] if svec is not None]
+            remain_svecs = [svec_list[k] for k in sent_level_idxs if svec_list[k] is not None]
+            remain_sweights = [sweights[k] for k in sent_level_idxs if svec_list[k] is not None]
+            if len(remain_svecs) > 0:
+                remain_svecs = np.stack(remain_svecs)
+                remain_sweights = np.array(remain_sweights)
+            else:
+                remain_svecs = None
+                remain_sweights = None
+        filtered_ref_sents_vecs.append(remain_svecs)
+        filtered_ref_sent_weights.append(remain_sweights)
+    
+    #####################################################################################################################################
+
+
+    # Getting the summary vectors perhaps?
+    #####################################################################################################################################
+    
+
+    
+
+    # get sents in system summaries
+    filtered_summ_tokens_vecs = []
+    filtered_summ_tokens = []
+    filtered_summ_token_weights = []
+    filtered_summ_sents_vecs = []
+    filtered_summ_sent_weights = []
+
+    # I am assuming bert_model.encode can encode a batch of data at once
+    # [pred1, pred2, pred3] where pred are str
+    one_summ_sents_vecs, one_summ_tokens_vecs, one_summ_tokens = bert_model.encode(predictions, sent_represnt_type)
+    vv, tt, _ = get_token_vecs(vecs=one_summ_tokens_vecs, tokens=one_summ_tokens)
+    svv = np.stack([svec for svec in one_summ_sents_vecs if svec is not None])
+    tweights = np.ones(tt.shape[0])
+    sweights = np.ones(svv.shape[0])
+
+    filtered_summ_tokens_vecs.append(vv)
+    filtered_summ_tokens.append(tt)
+    filtered_summ_token_weights.append(tweights)
+    filtered_summ_sents_vecs.append(svv)
+    filtered_summ_sent_weights.append(sweights)
+
+    #####################################################################################################################################
+
+    # get the merged sent and token representations of references
+    filtered_ref_mrgd_vecs, filtered_ref_mrgd_weights = mrg_tokens_sents(filtered_ref_tokens_vecs,
+                                                                            filtered_ref_token_weights,
+                                                                            filtered_ref_sents_vecs,
+                                                                            filtered_ref_sent_weights)
+    # get the merged sent and token representations of summs
+    filtered_summ_mrgd_vecs, filtered_summ_mrgd_weights = mrg_tokens_sents(filtered_summ_tokens_vecs,
+                                                                            filtered_summ_token_weights,
+                                                                            filtered_summ_sents_vecs,
+                                                                            filtered_summ_sent_weights)
+
+    
+    if map_type_ref == 't':
+        # token2* mapping
+        assert ref_st_mrg_type == 'wAll_sAll'
+        final_ref_vecs = filtered_ref_tokens_vecs
+        final_ref_weights = filtered_ref_token_weights
+    elif map_type_ref == 's':
+        # sent2* mapping
+        assert 'idf' not in wmd_score_type
+        final_ref_vecs = filtered_ref_sents_vecs
+        final_ref_weights = filtered_ref_sent_weights
+    else:
+        # (sent+token)2* mapping
+        assert 'idf' not in wmd_score_type
+        assert map_type_ref == 'st'
+        final_ref_vecs = filtered_ref_mrgd_vecs
+        final_ref_weights = filtered_ref_mrgd_weights
+
+    # for summ
+    if map_type_summ == 't':
+        # *2token mapping
+        final_summ_vecs = filtered_summ_tokens_vecs
+        final_summ_weights = filtered_summ_token_weights
+    elif map_type_summ == 's':
+        # *2sent mapping
+        assert 'idf' not in wmd_score_type
+        final_summ_vecs = filtered_summ_sents_vecs
+        final_summ_weights = filtered_summ_sent_weights
+    else:
+        # *2(sent+token) mapping
+        assert 'idf' not in wmd_score_type
+        assert map_type_summ == 'st'
+        final_summ_vecs = filtered_summ_mrgd_vecs
+        final_summ_weights = filtered_summ_mrgd_weights
+
+
+
+    # relevance/informativeness score
+    relevance_score = get_my_score(final_ref_vecs, final_ref_weights, filtered_ref_tokens,
+                                    final_summ_vecs, final_summ_weights, filtered_summ_tokens,
+                                    wmd_score_type, wmd_weight_type, beta_gamma=beta_gamma)
+    # redundancy score
+    redund_score = []
+    for i in range(len(filtered_summ_tokens_vecs)):
+        redund_score_i = get_my_score([filtered_summ_tokens_vecs[i]], [filtered_summ_token_weights[i]], [filtered_summ_tokens[i]],
+                                        [filtered_summ_tokens_vecs[i]], [filtered_summ_token_weights[i]], [filtered_summ_tokens[i]],
+                                        wmd_score_type='recall', wmd_weight_type='none', mask_self=True)
+        redund_score.append(redund_score_i[0])
+
+
+    # PSS is the final result
+    pss = []
+    for i in range(len(relevance_score)):
+        if relevance_score[i] is not None and redund_score[i] is not None:
+            pss.append((relevance_score[i] - lambda_redund * redund_score[i]) / (1 + lambda_redund))
+
+
+    # Return EVAL_Base type data
+
+    return {'score': pss}
+    
+
+
+
+
 if __name__ == '__main__':
     # get the general configuration
     parser = config.ArgumentParser("my_score_metrics.py")
@@ -502,5 +726,3 @@ if __name__ == '__main__':
                          doc_num_limit=doc_num_limit,
                          score_saved_file=score_saved_file,
                          device=device)
-
-
