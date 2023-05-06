@@ -455,16 +455,14 @@ def run_my_score_metrics(year, ref_metric, wmd_score_type, wmd_weight_type,
 
 ######################################################
 #
-#   EVAL_BASE SCORE FUNCTION
-#  
-#   DON'T KNOW IF THIS WILL WORK
+#
 #
 #
 #   Input: [str, str, str]                      <--- 2 of them, 1 pred, 1 ref 
-#   Output: {'score': [float, float, float]}    <--- EvalBase type 
+#   Output: {'score': [float, float, float]}    
 #
 #####################################################
-def score_function_eval_base(predictions, references):
+def score_function(predictions, references):
 
 
     # Some variables 
@@ -569,7 +567,7 @@ def score_function_eval_base(predictions, references):
     #####################################################################################################################################
 
 
-    # Getting the summary vectors perhaps?
+    # Getting the summary vectors 
     #####################################################################################################################################
     
 
